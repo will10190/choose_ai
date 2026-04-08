@@ -19,7 +19,6 @@ import time
 
 FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
 
-
 # ─────────────────────────────────────────────
 # 1. 取得全市場股票名單（含 type 欄位）
 # ─────────────────────────────────────────────
@@ -47,7 +46,7 @@ def get_all_stocks(token: str = "") -> pd.DataFrame:
 @st.cache_data(ttl=3600)
 def get_recent_trading_dates(token: str, lookback_days: int = 250) -> list:
     start = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    end   = datetime.today().strftime("%Y-%m-%d")
+    end = datetime.today().strftime("%Y-%m-%d")
     params = {
         "dataset": "TaiwanStockPrice",
         "data_id": "2330",
@@ -80,7 +79,7 @@ def _bulk_download(dataset: str, dates: list, token: str) -> pd.DataFrame:
                 data = resp.json().get("data", [])
                 if data:
                     all_data.extend(data)
-                print(f"✅ [{dataset}] {d} 下載成功 ({i+1}/{len(dates)})")
+                    print(f"✅ [{dataset}] {d} 下載成功 ({i+1}/{len(dates)})")
             else:
                 print(f"🚨 [{dataset}] {d} 遭拒絕: {resp.text}")
         except Exception as e:
@@ -118,7 +117,7 @@ def load_all_market_data(token: str, use_c45: bool = True):
         holdings_df = _bulk_download("TaiwanStockHoldingSharesPer", fridays[-6:], token)
 
     print("\n📦 === 大補帖下載完畢，建立高速字典 ===")
-    prices_dict   = dict(tuple(price_df.groupby("stock_id")))   if not price_df.empty   else {}
+    prices_dict = dict(tuple(price_df.groupby("stock_id"))) if not price_df.empty else {}
     holdings_dict = dict(tuple(holdings_df.groupby("stock_id"))) if not holdings_df.empty else {}
 
     return prices_dict, holdings_dict
@@ -126,25 +125,15 @@ def load_all_market_data(token: str, use_c45: bool = True):
 
 # ─────────────────────────────────────────────
 # 5. 事後補充：只為篩選後的贏家抓外資資料
-#
-#  TaiwanStockInstitutionalInvestorsBuySell 已同時包含上市與上櫃。
-#  按日期 bulk 下載即可拿到全市場，不需要分流。
-#  之前上櫃顯示 0 的原因是 name 欄位篩選用中文沒匹配，
-#  現在已改為 Foreign_Investor，上市上櫃都能正確取到。
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_foreign_data_for_winners(
-    winner_sids: tuple,    # tuple 才能被 st.cache_data 快取
-    type_map: tuple,       # 保留簽名相容，不再用來分流
+    winner_sids: tuple,
+    type_map: tuple,
     token: str,
     lookback_days: int = 15,
-    c5_days: int = 0,      # 僅記錄用，實際過濾在 app.py
+    c5_days: int = 0,
 ) -> dict:
-    """
-    針對篩選後的贏家補充外資資料。
-    上市 + 上櫃 都在 TaiwanStockInstitutionalInvestorsBuySell 裡，
-    bulk 下載後過濾贏家，回傳 {stock_id: inst_df}。
-    """
     if not winner_sids:
         return {}
 
@@ -155,16 +144,14 @@ def load_foreign_data_for_winners(
     recent_dates = trading_dates[-lookback_days:]
     print(f"\n📡 [外資補充] bulk 下載近 {len(recent_dates)} 天（上市+上櫃）...")
 
-    inst_df = _bulk_download(
-        "TaiwanStockInstitutionalInvestorsBuySell", recent_dates, token
-    )
+    inst_df = _bulk_download("TaiwanStockInstitutionalInvestorsBuySell", recent_dates, token)
 
     if inst_df.empty:
         print("⚠️ [外資補充] 無任何資料")
         return {}
 
     inst_df = inst_df[inst_df["stock_id"].isin(winner_sids)]
-    found   = inst_df["stock_id"].unique().tolist()
+    found = inst_df["stock_id"].unique().tolist()
     missing = [s for s in winner_sids if s not in found]
 
     print(f"✅ [外資補充] 取得 {len(found)} 檔：{found}")
@@ -175,13 +162,65 @@ def load_foreign_data_for_winners(
 
 
 # ─────────────────────────────────────────────
+# 6. 【新增】取得所有券商代碼與名稱（免費可用）
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=86400)
+def get_all_trader_info(token: str) -> pd.DataFrame:
+    params = {"dataset": "TaiwanSecuritiesTraderInfo", "token": token}
+    try:
+        resp = requests.get(FINMIND_API_URL, params=params, timeout=15)
+        if resp.status_code == 200:
+            df = pd.DataFrame(resp.json().get("data", []))
+            return df
+        print(f"🚨 [券商清單] API 錯誤 {resp.status_code}")
+    except Exception as e:
+        print(f"🚨 [券商清單] 連線錯誤: {e}")
+    return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────
+# 7. 【新增】查詢特定券商分點在某日的所有買賣股票（Backer 可用）
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_branch_trading_by_trader(
+    securities_trader_id: str,
+    date: str,
+    token: str,
+) -> pd.DataFrame:
+    params = {
+        "dataset": "TaiwanStockTradingDailyReport",
+        "securities_trader_id": securities_trader_id,
+        "start_date": date,
+        "end_date": date,
+        "token": token,
+    }
+    try:
+        resp = requests.get(FINMIND_API_URL, params=params, timeout=20)
+        if resp.status_code != 200:
+            print(f"🚨 [分點by券商] {resp.status_code}: {resp.text}")
+            return pd.DataFrame()
+        data = resp.json().get("data", [])
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        for col in ["buy", "sell", "price"]:
+            df[col] = pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0)
+        df["buy_lots"] = (df["buy"] / 1000).round(1)
+        df["sell_lots"] = (df["sell"] / 1000).round(1)
+        df["net_lots"] = (df["buy_lots"] - df["sell_lots"]).round(1)
+        return df
+    except Exception as e:
+        print(f"🚨 [分點by券商] 連線錯誤: {e}")
+        return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────
 # 條件 1：當日收盤價 > 5/10/20 週均線
 # ─────────────────────────────────────────────
 def check_above_weekly_mas(df: pd.DataFrame) -> dict:
     result = {"passed": False, "close": 0, "wma5": 0, "wma10": 0, "wma20": 0}
     if df is None or df.empty:
         return result
-
     try:
         df = df.copy()
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
@@ -192,7 +231,7 @@ def check_above_weekly_mas(df: pd.DataFrame) -> dict:
         if len(weekly_df) < 20:
             return result
 
-        weekly_df["WMA5"]  = weekly_df["close"].rolling(5).mean()
+        weekly_df["WMA5"] = weekly_df["close"].rolling(5).mean()
         weekly_df["WMA10"] = weekly_df["close"].rolling(10).mean()
         weekly_df["WMA20"] = weekly_df["close"].rolling(20).mean()
         weekly_df = weekly_df.dropna()
@@ -201,14 +240,14 @@ def check_above_weekly_mas(df: pd.DataFrame) -> dict:
             return result
 
         latest = weekly_df.iloc[-1]
-        close  = latest["close"]
+        close = latest["close"]
         w5, w10, w20 = latest["WMA5"], latest["WMA10"], latest["WMA20"]
 
         result.update({
-            "close":  round(close, 2),
-            "wma5":   round(w5, 2),
-            "wma10":  round(w10, 2),
-            "wma20":  round(w20, 2),
+            "close": round(close, 2),
+            "wma5": round(w5, 2),
+            "wma10": round(w10, 2),
+            "wma20": round(w20, 2),
             "passed": (close > w5) and (close > w10) and (close > w20),
         })
     except Exception:
@@ -229,6 +268,7 @@ def check_ma_tangle_or_golden_cross(
         "passed": False, "ma5": 0, "ma20": 0, "ma60": 0, "ma100": 0,
         "is_tangle": False, "is_golden_cross": False, "tangle_spread_pct": 0,
     }
+
     if df is None or df.empty or len(df) < 100:
         return result
 
@@ -247,10 +287,10 @@ def check_ma_tangle_or_golden_cross(
         today, yesterday = df.iloc[-1], df.iloc[-2]
         ma5, ma20, ma60, ma100 = today["MA5"], today["MA20"], today["MA60"], today["MA100"]
 
-        ma_min     = min(ma5, ma20, ma60, ma100)
+        ma_min = min(ma5, ma20, ma60, ma100)
         spread_pct = (max(ma5, ma20, ma60, ma100) - ma_min) / ma_min * 100 if ma_min > 0 else 999
 
-        is_tangle       = spread_pct < tangle_threshold_pct
+        is_tangle = spread_pct < tangle_threshold_pct
         is_golden_cross = (today["MA20"] > today["MA100"]) and (yesterday["MA20"] <= yesterday["MA100"])
 
         result.update({
@@ -275,27 +315,20 @@ def check_ma_tangle_or_golden_cross(
 # 外資連買計算（展示用 + 條件⑤判斷用）
 # ─────────────────────────────────────────────
 def get_foreign_buy_info(inst_df: pd.DataFrame) -> dict:
-    """
-    計算外資連續買超天數 + 今日外資淨買（股）
-    只計算 Foreign_Investor，排除 Foreign_Dealer_Self（外資自營）
-    """
     result = {"foreign_net_today": 0, "foreign_consecutive_days": 0}
     if inst_df is None or inst_df.empty:
         return result
-
     try:
         inst_df = inst_df.copy()
-
-        # 只取 Foreign_Investor（不含外資自營）
-        mask       = inst_df["name"].str.contains("Foreign_Investor|外資及陸資", case=False, na=False)
+        mask = inst_df["name"].str.contains("Foreign_Investor|外資及陸資", case=False, na=False)
         foreign_df = inst_df[mask].copy()
 
         if foreign_df.empty:
             return result
 
-        foreign_df["buy"]  = pd.to_numeric(foreign_df["buy"],  errors="coerce").fillna(0)
+        foreign_df["buy"] = pd.to_numeric(foreign_df["buy"], errors="coerce").fillna(0)
         foreign_df["sell"] = pd.to_numeric(foreign_df["sell"], errors="coerce").fillna(0)
-        foreign_df["net"]  = foreign_df["buy"] - foreign_df["sell"]
+        foreign_df["net"] = foreign_df["buy"] - foreign_df["sell"]
 
         daily_net = (
             foreign_df.groupby("date")["net"]
@@ -303,10 +336,10 @@ def get_foreign_buy_info(inst_df: pd.DataFrame) -> dict:
         )
 
         if not daily_net.empty:
-            result["foreign_net_today"]         = int(daily_net["net"].iloc[-1])
-            result["foreign_consecutive_days"]  = _count_consecutive_positive(daily_net["net"].values)
+            result["foreign_net_today"] = int(daily_net["net"].iloc[-1])
+            result["foreign_consecutive_days"] = _count_consecutive_positive(daily_net["net"].values)
     except Exception as e:
-        print(f"  [外資] 計算例外: {e}")
+        print(f" [外資] 計算例外: {e}")
     return result
 
 
@@ -323,6 +356,7 @@ def check_shareholding_distribution(
         "latest_whale_people": 0, "latest_total_people": 0,
         "whale_trend": 0, "total_trend": 0,
     }
+
     if df is None or df.empty:
         return result
 
@@ -333,19 +367,27 @@ def check_shareholding_distribution(
         if len(weekly_dates) < 2:
             return result
 
+        WHALE_LEVELS = {
+            "400,001-600,000",
+            "600,001-800,000",
+            "800,001-1,000,000",
+            "more than 1,000,001",
+        }
+
         weekly_stats = []
         for d in weekly_dates:
-            week_df  = df[df["date"] == d]
+            week_df = df[df["date"] == d]
             valid_df = week_df[
-                ~week_df["HoldingSharesLevel"].astype(str).str.contains("合計|total", case=False, na=False)
+                ~week_df["HoldingSharesLevel"].astype(str).str.contains("合計|total|差異", case=False, na=False)
             ]
-            whale_mask = valid_df["HoldingSharesLevel"].astype(str).str.contains(
-                r"400,001|600,001|800,001|1,000,001|2,000,001|3,000,001|4,000,001|5,000,001", na=False
-            )
+            level_str = valid_df["HoldingSharesLevel"].astype(str)
+            whale_mask = level_str.isin(WHALE_LEVELS)
+            whale_cnt = int(valid_df[whale_mask]["people"].sum())
+            total_cnt = int(valid_df["people"].sum())
             weekly_stats.append({
-                "date":         d,
-                "whale_people": valid_df[whale_mask]["people"].sum(),
-                "total_people": valid_df["people"].sum(),
+                "date": d,
+                "whale_people": whale_cnt,
+                "total_people": total_cnt,
             })
 
         stats_df = pd.DataFrame(weekly_stats).sort_values("date")
@@ -358,7 +400,7 @@ def check_shareholding_distribution(
             "latest_total_people": int(latest["total_people"]),
         })
 
-        n_whale       = min(whale_increase_weeks,       len(stats_df) - 1)
+        n_whale = min(whale_increase_weeks, len(stats_df) - 1)
         n_shareholder = min(shareholder_decrease_weeks, len(stats_df) - 1)
 
         whale_values = stats_df["whale_people"].values
@@ -374,9 +416,9 @@ def check_shareholding_distribution(
         )
 
         result.update({
-            "whale_trend":        int(latest["whale_people"] - stats_df.iloc[-2]["whale_people"]),
-            "total_trend":        int(latest["total_people"] - stats_df.iloc[-2]["total_people"]),
-            "whale_passed":       whale_increasing,
+            "whale_trend": int(latest["whale_people"] - stats_df.iloc[-2]["whale_people"]),
+            "total_trend": int(latest["total_people"] - stats_df.iloc[-2]["total_people"]),
+            "whale_passed": whale_increasing,
             "shareholder_passed": total_decreasing,
         })
     except Exception as e:
