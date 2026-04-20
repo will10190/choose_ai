@@ -2,7 +2,6 @@
 """
 broker_scraper.py
 券商分點爬蟲模組 — 不需要 FinMind Token，直接爬富邦 DJ 網站
-[Fix] 修正分點名稱疊字問題
 [Update] 修復多日查詢邏輯：改用單日精準回推，避免 d 參數累計加總導致的數據偏移
 """
 
@@ -180,56 +179,42 @@ def get_branch_data_cached(branch_name: str, a_code: str, b_code: str) -> pd.Dat
 
 def fetch_branch_multi_day(a_code: str, b_code: str, days: int = 5) -> pd.DataFrame:
     """
-    精準回推法：先撈最新一天，再逐日往前推算，避開假日，直到收滿 5 個交易日為止。
-    這能確保每一天都是獨立的買賣超資料，不會被富邦 DJ 的累積加總 (d=2,3...) 影響。
+    精準回推法：先撈最新一天，再逐日往前推算，避開假日，直到收滿指定天數。
     """
     _ensure_session_cookie(force=True)
     all_records = []
     collected_dates = []
 
-    # 1. 取得最新的一個交易日
     try:
         params = {"a": a_code, "b": b_code, "c": "E", "d": "1"}
         resp = _SESSION.get(BRANCH_DATA_URL, params=params, verify=False, timeout=15)
         resp.encoding = "big5"
         date_match = re.search(r"資料日期[：:]\s*(\d{8})", resp.text)
-        
-        if not date_match:
-            return pd.DataFrame(columns=["股票代號", "股票名稱", "資料日期", "買賣超"])
-            
-        latest_date_str = date_match.group(1)
-        current_check_date = datetime.strptime(latest_date_str, "%Y%m%d")
+        if not date_match: return pd.DataFrame(columns=["股票代號", "股票名稱", "資料日期", "買賣超"])
+        current_check_date = datetime.strptime(date_match.group(1), "%Y%m%d")
     except Exception:
         return pd.DataFrame(columns=["股票代號", "股票名稱", "資料日期", "買賣超"])
 
-    # 2. 從最新日開始逐日往前回推
     failsafe = 0
     while len(collected_dates) < days and failsafe < 20:
         failsafe += 1
         target_str = f"{current_check_date.year}-{current_check_date.month}-{current_check_date.day}"
-        
         try:
             params = {"a": a_code, "b": b_code, "c": "E", "e": target_str, "f": target_str}
             resp = _SESSION.get(BRANCH_DATA_URL, params=params, verify=False, timeout=15)
             resp.encoding = "big5"
             html = resp.text
-            
             match = re.search(r"資料日期[：:]\s*(\d{8})", html)
             if match:
-                ret_date_str = match.group(1)
-                ret_date = datetime.strptime(ret_date_str, "%Y%m%d")
-                
-                # 只有回傳日期與請求日期一致，才代表是有效交易日
+                ret_date = datetime.strptime(match.group(1), "%Y%m%d")
                 if ret_date == current_check_date:
                     fmt_date = ret_date.strftime("%Y/%m/%d")
                     if fmt_date not in collected_dates:
                         collected_dates.append(fmt_date)
-                        
                         soup = BeautifulSoup(html, "html.parser")
                         for tr in soup.find_all("tr"):
                             tds = tr.find_all("td", recursive=False)
                             if len(tds) != 4: continue
-
                             td_html = str(tds[0])
                             stock_id, stock_name = None, None
                             m_s = re.search(r"GenLink2stk\s*\(\s*['\"](?:AS)?([A-Za-z0-9]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)", td_html)
@@ -243,22 +228,12 @@ def fetch_branch_multi_day(a_code: str, b_code: str, days: int = 5) -> pd.DataFr
                             if stock_id and any(c.isdigit() for c in stock_id):
                                 net = _parse_int(tds[3].get_text(strip=True))
                                 if net is not None:
-                                    all_records.append({
-                                        "股票代號": stock_id,
-                                        "股票名稱": stock_name or "",
-                                        "資料日期": fmt_date,
-                                        "買賣超": net,
-                                    })
-        except Exception:
-            pass
-        
+                                    all_records.append({"股票代號": stock_id, "股票名稱": stock_name or "", "資料日期": fmt_date, "買賣超": net})
+        except Exception: pass
         current_check_date -= timedelta(days=1)
 
-    if not all_records:
-        return pd.DataFrame(columns=["股票代號", "股票名稱", "資料日期", "買賣超"])
-        
-    df = pd.DataFrame(all_records)
-    df = df.drop_duplicates(subset=["股票代號", "資料日期"], keep="first")
+    if not all_records: return pd.DataFrame(columns=["股票代號", "股票名稱", "資料日期", "買賣超"])
+    df = pd.DataFrame(all_records).drop_duplicates(subset=["股票代號", "資料日期"], keep="first")
     return df
 
 @st.cache_data(ttl=1800, show_spinner=False)
