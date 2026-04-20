@@ -16,7 +16,8 @@ from data_loader import (
     load_industry_chain_for_winners
 )
 from chart_plotter import plot_combined_chart
-from broker_scraper import fetch_broker_list, lookup_branch_code, get_branch_data_cached
+from broker_scraper import fetch_broker_list, lookup_branch_code, get_branch_data_cached  # kept for potential direct use
+from broker_page import render_broker_page
 
 # 🌟 匯入我們新寫好的獨立總經儀表板模組
 from macro_dashboard import render_macro_dashboard
@@ -108,7 +109,7 @@ render_macro_dashboard(FINMIND_TOKEN)
 # =====================================================================
 
 # 初始化 session_state
-for key, default in [("selected_stock", None), ("results", []), ("scan_done", False), ("branch_candidates", []), ("branch_selected", None), ("branch_result_df", None), ("branch_keyword", "")]:
+for key, default in [("selected_stock", None), ("results", []), ("scan_done", False)]:
     if key not in st.session_state: st.session_state[key] = default
 
 st.sidebar.header("🔧 選股條件設定")
@@ -367,142 +368,7 @@ with tab_screen:
     st.markdown("---")
 
 # ──────────────────────────────────────────────────────────
-# Tab 2：券商分點查詢 
+# Tab 2：券商分點查詢（獨立模組）
 # ──────────────────────────────────────────────────────────
 with tab_branch:
-    st.header("🏦 券商分點最新買賣超查詢")
-    st.caption("資料來源：富邦 DJ 資訊網（不需要 FinMind Token，每 30 分鐘快取一次）")
-
-    col_status, col_reload = st.columns([4, 1])
-    with col_reload:
-        if st.button("🔄 重新載入清單", key="reload_broker"):
-            st.cache_data.clear()
-            st.rerun()
-
-    broker_map = None
-    try:
-        with st.spinner("載入分點清單中..."):
-            broker_map = fetch_broker_list()
-        col_status.success(f"✅ 已載入 {len(broker_map):,} 個券商分點")
-    except Exception as e:
-        col_status.error(f"❌ 分點清單載入失敗：{e}")
-
-    st.markdown("---")
-
-    if broker_map:
-        st.markdown("##### 💡 熱門分點快速選擇")
-        popular = [("富邦仁愛", "9676"), ("國泰敦南", "8888")]
-        cols = st.columns(len(popular))
-        for i, (bname, bcode) in enumerate(popular):
-            with cols[i]:
-                if st.button(f"🔥 {bname}", key=f"pop_{i}", use_container_width=True):
-                    st.session_state["branch_keyword"] = ""
-                    st.session_state["branch_candidates"] = lookup_branch_code(bcode, broker_map)
-                    st.session_state["branch_selected"]   = None
-                    st.session_state["branch_result_df"]  = None
-                    st.rerun()
-    st.markdown("---")
-
-    col_input, col_search = st.columns([4, 1])
-    with col_input:
-        branch_keyword = st.text_input(
-            "輸入券商分點名稱或代碼（支援忽略 - 連字號，例如：國泰敦南、8888）",
-            key="branch_keyword",
-            placeholder="例如：富邦仁愛、國泰敦南、8888..."
-        )
-    with col_search:
-        st.markdown("<br>", unsafe_allow_html=True)
-        search_btn = st.button("🔍 搜尋", type="primary", key="branch_search_btn")
-
-    if search_btn and branch_keyword and broker_map:
-        st.session_state["branch_candidates"] = lookup_branch_code(branch_keyword, broker_map)
-        st.session_state["branch_selected"]   = None
-        st.session_state["branch_result_df"]  = None
-
-    candidates = st.session_state.get("branch_candidates", [])
-
-    if candidates:
-        if len(candidates) == 1:
-            if st.session_state.get("branch_selected") != candidates[0]:
-                st.session_state["branch_selected"] = candidates[0]
-                st.session_state["branch_result_df"] = None
-                st.rerun()
-            st.info(
-                f"✅ 自動對應：**{candidates[0]['name']}**"
-                f"（代碼：a={candidates[0]['a']}, b={candidates[0]['b']}）"
-            )
-        else:
-            names = [f"{c['name']} (代碼: {c['b']})" for c in candidates]
-            selected_name = st.selectbox("找到多個符合的分點，請選擇：", names, key="branch_selector")
-            idx = names.index(selected_name)
-            if st.session_state.get("branch_selected") != candidates[idx]:
-                st.session_state["branch_selected"] = candidates[idx]
-                st.session_state["branch_result_df"] = None
-                st.rerun()
-    elif search_btn and branch_keyword and broker_map:
-        st.warning(f"😔 找不到包含「{branch_keyword}」的分點，請確認名稱或代碼是否正確。")
-
-    selected_branch = st.session_state.get("branch_selected")
-
-    if selected_branch:
-        st.markdown("---")
-        st.markdown(f"### 📌 {selected_branch['name']} — 最新買賣超明細")
-
-        if st.button("🔄 重新整理快取 (30分鐘內資料不會變更)", key="refresh_branch"):
-            st.session_state["branch_result_df"] = None
-            st.cache_data.clear()
-            st.rerun()
-
-        result_df = st.session_state.get("branch_result_df")
-        if result_df is None:
-            try:
-                with st.spinner(f"抓取 {selected_branch['name']} 中..."):
-                    result_df = get_branch_data_cached(
-                        selected_branch["name"], selected_branch["a"], selected_branch["b"]
-                    )
-                st.session_state["branch_result_df"] = result_df
-            except Exception as e:
-                st.error(f"❌ 抓取失敗：{e}")
-                result_df = None
-
-        if result_df is not None:
-            if result_df.empty:
-                st.info("📭 該分點目前無最新的買賣超記錄。")
-            else:
-                data_date = result_df["資料日期"].iloc[0] if "資料日期" in result_df.columns else "N/A"
-                m1, m2, m3 = st.columns(3)
-                m1.metric("資料日期", data_date)
-                m2.metric("進出股票數", f"{len(result_df)} 支")
-                try:
-                    total_net = pd.to_numeric(result_df["買賣超"], errors="coerce").sum()
-                    m3.metric("合計買賣超 (張)", f"{int(total_net):,}")
-                except Exception:
-                    m3.metric("合計買賣超 (張)", "N/A")
-
-                display_df = result_df.copy()
-                for col in ["買張", "賣張", "買賣超"]:
-                    if col in display_df.columns:
-                        display_df[col] = pd.to_numeric(display_df[col], errors="coerce").fillna(0).astype(int)
-                
-                display_df["股票"] = display_df["股票代號"].astype(str) + " " + display_df["股票名稱"]
-                display_df = display_df.rename(columns={"買張": "買進張數", "賣張": "賣出張數", "買賣超": "差額"})
-                
-                df_buy = display_df[display_df["差額"] > 0].sort_values("差額", ascending=False).reset_index(drop=True)
-                df_sell = display_df[display_df["差額"] < 0].sort_values("差額", ascending=True).reset_index(drop=True)
-
-                col_buy, col_sell = st.columns(2)
-                max_rows = max(len(df_buy), len(df_sell))
-                dynamic_height = max_rows * 36 + 43
-                if dynamic_height < 200: dynamic_height = 200
-
-                with col_buy:
-                    st.markdown("<div class='side-by-side-header' style='color: #ef5350;'>📈 買超</div>", unsafe_allow_html=True)
-                    st.dataframe(df_buy[["股票", "買進張數", "賣出張數", "差額"]], use_container_width=True, hide_index=True, height=dynamic_height)
-
-                with col_sell:
-                    st.markdown("<div class='side-by-side-header' style='color: #26a69a;'>📉 賣超</div>", unsafe_allow_html=True)
-                    st.dataframe(df_sell[["股票", "買進張數", "賣出張數", "差額"]], use_container_width=True, hide_index=True, height=dynamic_height)
-
-                st.markdown("<br>", unsafe_allow_html=True)
-                csv_bytes = result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-                st.download_button("⬇️ 下載完整 CSV", data=csv_bytes, file_name=f"{selected_branch['name']}_買賣超_{data_date.replace('/','')}.csv", mime="text/csv", key="dl_csv")
+    render_broker_page()
