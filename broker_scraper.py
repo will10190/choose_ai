@@ -173,7 +173,7 @@ def fetch_branch_buy_list(branch_name: str, a_code: str, b_code: str) -> pd.Data
     df = df.drop_duplicates(subset=["股票代號"], keep="first")
     return df
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=7200, show_spinner=False)
 def get_branch_data_cached(branch_name: str, a_code: str, b_code: str) -> pd.DataFrame:
     return fetch_branch_buy_list(branch_name, a_code, b_code)
 
@@ -236,6 +236,6 @@ def fetch_branch_multi_day(a_code: str, b_code: str, days: int = 5) -> pd.DataFr
     df = pd.DataFrame(all_records).drop_duplicates(subset=["股票代號", "資料日期"], keep="first")
     return df
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=7200, show_spinner=False)
 def get_branch_multi_day_cached(branch_name: str, a_code: str, b_code: str, days: int = 5) -> pd.DataFrame:
     return fetch_branch_multi_day(a_code, b_code, days)
