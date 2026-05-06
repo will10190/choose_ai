@@ -45,7 +45,7 @@ def get_all_stocks(token: str = "") -> pd.DataFrame:
 # ─────────────────────────────────────────────
 # 2. 取得近期實際交易日
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=7200)
 def get_recent_trading_dates(token: str, lookback_days: int = 250) -> list:
     start = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     end = datetime.today().strftime("%Y-%m-%d")
@@ -62,7 +62,7 @@ def get_recent_trading_dates(token: str, lookback_days: int = 250) -> list:
 # ─────────────────────────────────────────────
 # 3. 大補帖：按日期批量下載全市場資料
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=7200, show_spinner=False)
 def _bulk_download(dataset: str, dates: list, token: str) -> pd.DataFrame:
     all_data = []
     for i, d in enumerate(dates):
@@ -89,7 +89,7 @@ def _bulk_download(dataset: str, dates: list, token: str) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 # 4. 主控台：大補帖（股價 + 集保）
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=7200, show_spinner=False)
 def load_all_market_data(token: str, use_c45: bool = True):
     trading_dates = get_recent_trading_dates(token)
     if not trading_dates: return {}, {}
@@ -108,7 +108,7 @@ def load_all_market_data(token: str, use_c45: bool = True):
 # ─────────────────────────────────────────────
 # 5. 事後補充：只為篩選後的贏家抓外資資料
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=7200, show_spinner=False)
 def load_foreign_data_for_winners(winner_sids: tuple, type_map: tuple, token: str, lookback_days: int = 15, c5_days: int = 0) -> dict:
     if not winner_sids: return {}
     trading_dates = get_recent_trading_dates(token)
@@ -250,4 +250,108 @@ def check_shareholding_distribution(df: pd.DataFrame, whale_increase_weeks: int 
             "whale_passed": whale_increasing, "shareholder_passed": total_decreasing,
         })
     except Exception as e: print(f"集保運算錯誤: {e}")
+    return result
+# ─────────────────────────────────────────────
+# 條件 6：KD 黃金交叉（K 由下往上穿越 D）
+# ─────────────────────────────────────────────
+def check_kd_golden_cross(df: pd.DataFrame, rsv_period: int = 9, lookback: int = 3) -> dict:
+    """
+    計算 KD 指標，判斷近 lookback 天內是否出現黃金交叉（K 由下穿上 D）。
+    ✅ 支援 max/min 欄位名稱（FinMind TaiwanStockPriceAdj 的實際欄位）
+    ✅ rsv 全部納入計算，不跳 iloc[0]，避免 off-by-one
+    """
+    result = {"passed": False, "k": 0.0, "d": 0.0, "cross_days_ago": -1}
+    if df is None or df.empty or len(df) < rsv_period + 5:
+        return result
+    try:
+        df = df.copy()
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        # 同時支援 high/low 和 max/min（FinMind 用 max/min）
+        high_col = "high" if "high" in df.columns else "max"
+        low_col  = "low"  if "low"  in df.columns else "min"
+        df["_high"] = pd.to_numeric(df[high_col], errors="coerce")
+        df["_low"]  = pd.to_numeric(df[low_col],  errors="coerce")
+        df = df.sort_values("date").reset_index(drop=True).dropna(subset=["_high", "_low", "close"])
+        if len(df) < rsv_period + 5:
+            return result
+
+        roll_high = df["_high"].rolling(rsv_period).max()
+        roll_low  = df["_low"].rolling(rsv_period).min()
+        denom = (roll_high - roll_low).replace(0, np.nan)
+        rsv = ((df["close"] - roll_low) / denom * 100).fillna(50).tolist()
+
+        k, d = 50.0, 50.0
+        k_vals, d_vals = [], []
+        for r in rsv:
+            k = k * 2/3 + r * 1/3
+            d = d * 2/3 + k * 1/3
+            k_vals.append(k)
+            d_vals.append(d)
+
+        result["k"] = round(k_vals[-1], 2)
+        result["d"] = round(d_vals[-1], 2)
+
+        # 近 lookback 天內，找 K 由下穿上 D
+        for i in range(1, lookback + 1):
+            idx = len(k_vals) - i   # i=1=今天, i=2=昨天 ...
+            if idx < 1:
+                break
+            if k_vals[idx - 1] < d_vals[idx - 1] and k_vals[idx] >= d_vals[idx]:
+                result["passed"] = True
+                result["cross_days_ago"] = i - 1   # 0=今天, 1=昨天 ...
+                break
+
+    except Exception as e:
+        print(f"KD 計算錯誤: {e}")
+    return result
+
+
+# ─────────────────────────────────────────────
+# 條件 7：MACD 柱狀體（DIF-DEA）絕對值 < 門檻
+# ─────────────────────────────────────────────
+def check_macd_near_zero(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9,
+                          histogram_band: float = 0.1,
+                          require_positive_histogram: bool = False) -> dict:
+    """
+    計算 MACD，判斷柱狀體（DIF - DEA）絕對值是否 < histogram_band。
+    histogram_band 預設 0.1，可調整為 0.1 / 0.2 / 0.3 / 0.5 / 1.0。
+    require_positive_histogram：若 True，同時要求柱狀體 > 0（紅柱翻正）。
+    """
+    result = {
+        "passed":    False,
+        "dif":       0.0,
+        "dea":       0.0,
+        "histogram": 0.0,
+    }
+    if df is None or df.empty or len(df) < slow + signal + 5:
+        return result
+    try:
+        df = df.copy()
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df = df.sort_values("date").reset_index(drop=True).dropna(subset=["close"])
+        if len(df) < slow + signal + 5:
+            return result
+
+        close     = df["close"]
+        ema_fast  = close.ewm(span=fast,   adjust=False).mean()
+        ema_slow  = close.ewm(span=slow,   adjust=False).mean()
+        dif       = ema_fast - ema_slow
+        dea       = dif.ewm(span=signal,   adjust=False).mean()
+        histogram = dif - dea               # DIF - MACD（DEA），不乘 2，與看盤軟體一致
+
+        latest_dif  = round(float(dif.iloc[-1]),  4)
+        latest_dea  = round(float(dea.iloc[-1]),  4)
+        latest_hist = round(float(histogram.iloc[-1]), 4)
+
+        near_zero     = abs(latest_hist) < histogram_band
+        hist_positive = latest_hist > 0
+
+        result.update({
+            "passed":    near_zero and (hist_positive if require_positive_histogram else True),
+            "dif":       latest_dif,
+            "dea":       latest_dea,
+            "histogram": latest_hist,
+        })
+    except Exception as e:
+        print(f"MACD 計算錯誤: {e}")
     return result
