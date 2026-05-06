@@ -13,7 +13,8 @@ import random
 from data_loader import (
     get_all_stocks, load_all_market_data, load_foreign_data_for_winners,
     check_above_weekly_mas, check_ma_tangle_or_golden_cross, check_shareholding_distribution,
-    load_industry_chain_for_winners
+    load_industry_chain_for_winners,
+    check_kd_golden_cross, check_macd_near_zero,
 )
 from chart_plotter import plot_combined_chart
 from broker_scraper import fetch_broker_list, lookup_branch_code, get_branch_data_cached  # kept for potential direct use
@@ -133,6 +134,13 @@ c5_days = st.sidebar.slider("外資連買天數 ≥", 1, 20, 3, disabled=not use
 other_conditions_on = use_c1 or use_c2 or use_c3 or use_c4
 if use_c5 and not other_conditions_on: st.sidebar.warning("⚠️ 條件⑤需搭配①②③④其中一個使用。")
 st.sidebar.markdown("---")
+use_c6 = st.sidebar.checkbox("⑥ KD 黃金交叉（近 N 天）", value=False)
+c6_lookback = st.sidebar.slider("黃金交叉在幾天內發生", 1, 5, 3, disabled=not use_c6)
+st.sidebar.markdown("---")
+use_c7 = st.sidebar.checkbox("⑦ MACD 柱狀體（DIF-DEA）絕對值 < N", value=False)
+c7_band = st.sidebar.select_slider("柱狀體門檻", options=[0.1, 0.2, 0.3, 0.5, 1.0], value=0.1, disabled=not use_c7)
+c7_hist_pos = st.sidebar.checkbox("同時要求柱狀體 > 0（紅柱翻正）", value=False, disabled=not use_c7)
+st.sidebar.markdown("---")
 st.sidebar.subheader("📊 K 線均線顯示")
 show_ma = {"MA5": st.sidebar.checkbox("MA5", value=True), "MA20": st.sidebar.checkbox("MA20", value=True), "MA60": st.sidebar.checkbox("MA60", value=True), "MA100": st.sidebar.checkbox("MA100", value=True), "MA120": st.sidebar.checkbox("MA120", value=False), "MA240": st.sidebar.checkbox("MA240", value=False)}
 k_line_type = st.sidebar.radio("K 線類型", ["一般K線", "還原K線"], index=0)
@@ -149,7 +157,7 @@ with tab_screen:
 
     if start_btn:
         if use_c5 and not other_conditions_on: st.error("❌ 條件⑤需搭配其他條件使用。"); st.stop()
-        if not any([use_c1, use_c2, use_c3, use_c4, use_c5]): st.error("❌ 請至少啟用一個條件。"); st.stop()
+        if not any([use_c1, use_c2, use_c3, use_c4, use_c5, use_c6, use_c7]): st.error("❌ 請至少啟用一個條件。"); st.stop()
         if DEBUG_MODE:
             with st.spinner("🐛 Debug 模式：產生假資料中..."): time.sleep(0.3)
             st.session_state.results = _make_mock_results(8); st.session_state.scan_done = True; st.session_state.selected_stock = None; st.rerun()
@@ -184,7 +192,7 @@ with tab_screen:
             progress.progress(int((i + 1) / total * 80))
             status.text(f"篩選 {sid} {name_map.get(sid,'')}（{i+1}/{total}）")
             stock_price_df, stock_holdings_df = prices_dict.get(sid, pd.DataFrame()), holdings_dict.get(sid, pd.DataFrame())
-            any_failed, c1_res, c2_res, c34_res = False, {}, {}, {}
+            any_failed, c1_res, c2_res, c34_res, c6_res, c7_res = False, {}, {}, {}, {}, {}
 
             if use_c1 and not any_failed:
                 c1_res = check_above_weekly_mas(stock_price_df)
@@ -196,10 +204,16 @@ with tab_screen:
                 c34_res = check_shareholding_distribution(stock_holdings_df, c3_weeks, c4_weeks)
                 if use_c3 and not c34_res.get("whale_passed", False): any_failed = True
                 if use_c4 and not c34_res.get("shareholder_passed", False): any_failed = True
+            if use_c6 and not any_failed:
+                c6_res = check_kd_golden_cross(stock_price_df, lookback=c6_lookback)
+                if not c6_res.get("passed", False): any_failed = True
+            if use_c7 and not any_failed:
+                c7_res = check_macd_near_zero(stock_price_df, histogram_band=c7_band, require_positive_histogram=c7_hist_pos)
+                if not c7_res.get("passed", False): any_failed = True
 
             if not any_failed:
                 winner_sids.append(sid)
-                winner_data[sid] = {"c1": c1_res, "c2": c2_res, "c34": c34_res, "price_df": stock_price_df}
+                winner_data[sid] = {"c1": c1_res, "c2": c2_res, "c34": c34_res, "c6": c6_res, "c7": c7_res, "price_df": stock_price_df}
 
         progress.progress(80); status.text(f"🎯 篩選到 {len(winner_sids)} 檔贏家！正連線取得外資與次產業資料...")
         
@@ -213,6 +227,8 @@ with tab_screen:
             c1_res = data["c1"] if isinstance(data["c1"], dict) and data["c1"] else check_above_weekly_mas(data["price_df"])
             c2_res = data["c2"] if isinstance(data["c2"], dict) and data["c2"] else check_ma_tangle_or_golden_cross(data["price_df"], c2_tangle_pct, False, False)
             c34_res = data["c34"] if isinstance(data["c34"], dict) and data["c34"] else check_shareholding_distribution(pd.DataFrame(), 0, 0)
+            c6_res = data.get("c6", {})
+            c7_res = data.get("c7", {})
             inst_df_sid, price_df = inst_dict.get(sid, pd.DataFrame()), data["price_df"].copy()
 
             if not inst_df_sid.empty:
@@ -266,6 +282,11 @@ with tab_screen:
                 "散戶週變化 (人)": c34_res.get("total_trend", 0), 
                 "糾結度 (%)": c2_res.get("tangle_spread_pct", 0.0),
                 "乖離 20WMA (%)": round(bias_20w, 2), 
+                "KD_K": c6_res.get("k", 0.0),
+                "KD_D": c6_res.get("d", 0.0),
+                "KD交叉天前": c6_res.get("cross_days_ago", -1),
+                "MACD_柱狀": c7_res.get("histogram", 0.0),
+                "MACD_DIF": c7_res.get("dif", 0.0),
                 "_price_df": price_df,
             })
 
@@ -281,87 +302,92 @@ with tab_screen:
             stock_list_str = "、".join(f"{r['代號']} {r['名稱']}" for r in results)
             st.success(f"🎉 找到 **{len(results)}** 檔超級潛力股：{stock_list_str}")
 
-            html = "<div style='overflow-x: auto; margin-bottom: 20px; border: 1px solid #ddd; border-radius: 8px; background-color: #fff;'>"
-            html += "<table class='custom-stock-table' style='width:100%; border-collapse: collapse; white-space: nowrap; font-size: 14px; text-align: center;'>"
-            html += "<thead><tr>"
-            
-            headers = ["代號", "名稱 (含產業別)", "收盤價", "今日漲跌%", "外資連買(天)", "外資買超(張)", "大戶週變化", "散戶週變化", "糾結度%", "乖離20WMA%"]
-            for h in headers:
-                align = "left" if h == "名稱 (含產業別)" else "center"
-                html += f"<th style='text-align: {align};'>{h}</th>"
-            html += "</tr></thead><tbody>"
+            # ── 表頭 ──────────────────────────────────────────
+            COL_W = [0.7, 2.2, 0.8, 0.8, 0.9, 1.0, 0.9, 0.9, 0.8, 0.9]
+            if use_c6: COL_W.extend([0.7, 0.7, 0.7])
+            if use_c7: COL_W.extend([0.8, 0.7])
+            hdr = st.columns(COL_W)
+            HEADERS = ["代號", "名稱 / 產業", "收盤價", "漲跌%", "外資連買", "外資買超(張)", "大戶週變化", "散戶週變化", "糾結度%", "乖離20W%"]
+            if use_c6: HEADERS.extend(["KD(K)", "KD(D)", "交叉天前"])
+            if use_c7: HEADERS.extend(["MACD柱狀", "DIF"])
+            for col, h in zip(hdr, HEADERS):
+                col.markdown(f"<div style='font-size:12px;color:#888;font-weight:600;padding:4px 0;border-bottom:2px solid #ddd;'>{h}</div>", unsafe_allow_html=True)
+
+            # ── 每一列 ────────────────────────────────────────
+            selected_sid = st.session_state.get("selected_stock", {})
+            selected_sid = selected_sid.get("sid") if isinstance(selected_sid, dict) else None
 
             for r in results:
                 sid, name, close, dpct = r["代號"], r["名稱"], r["收盤價"], r["今日漲跌 (%)"]
                 industry = r.get("產業", "")
-                
-                dc = "#c0392b" if dpct >= 0 else "#16a085"
+                dc   = "#c0392b" if dpct >= 0 else "#16a085"
                 fnet = r["今日外資買超 (張)"]
-                fc = "#c0392b" if fnet >= 0 else "#16a085"
-                whale = r["大戶週變化 (人)"]
-                wc = "#c0392b" if whale > 0 else "#16a085" if whale < 0 else "#999"
+                fc   = "#c0392b" if fnet >= 0 else "#16a085"
+                whale  = r["大戶週變化 (人)"]
+                wc   = "#c0392b" if whale > 0 else "#16a085" if whale < 0 else "#999"
                 retail = r["散戶週變化 (人)"]
-                rc = "#16a085" if retail < 0 else "#c0392b" if retail > 0 else "#999"
+                rc   = "#16a085" if retail < 0 else "#c0392b" if retail > 0 else "#999"
+                is_selected = (sid == selected_sid)
 
-                html += f"<tr>"
-                html += f"<td style='color:#555;'>{sid}</td>"
-                html += f"<td style='text-align: left;'>"
-                html += f"    <div style='font-weight: bold; color: #1a1a1a;'>{name}</div>"
-                html += f"    <div style='font-size: 11px; color: #888; margin-top: 2px;'>{industry}</div>"
-                html += f"</td>"
-                html += f"<td>{close:.2f}</td>"
-                html += f"<td style='color:{dc}; font-weight:bold;'>{dpct:+.2f}%</td>"
-                html += f"<td>{int(r['外資連買 (天)'])} 天</td>"
-                html += f"<td style='color:{fc};'>{int(fnet):,} 張</td>"
-                html += f"<td style='color:{wc};'>{int(whale):+,} 人</td>"
-                html += f"<td style='color:{rc};'>{int(retail):+,} 人</td>"
-                html += f"<td style='color:#666;'>{r['糾結度 (%)']:.2f}%</td>"
-                html += f"<td style='color:#666;'>{r['乖離 20WMA (%)']:+.2f}%</td>"
-                html += "</tr>"
+                row_bg = "background:#f0f7ff; border-radius:6px;" if is_selected else ""
+                st.markdown(f"<div style='height:1px;background:#f0f0f0;margin:0;'></div>", unsafe_allow_html=True)
+                cols = st.columns(COL_W)
+                cols[0].markdown(f"<div style='color:#555;font-size:13px;padding:6px 0;{row_bg}'>{sid}</div>", unsafe_allow_html=True)
 
-            html += "</tbody></table></div>"
-            st.markdown(html, unsafe_allow_html=True)
+                # 名稱欄：按鈕
+                btn_label = f"{'▼ ' if is_selected else ''}{name}"
+                if cols[1].button(btn_label, key=f"btn_{sid}", use_container_width=True):
+                    if is_selected:
+                        st.session_state.selected_stock = None
+                    else:
+                        st.session_state.selected_stock = {"sid": sid, "name": name, "price_df": r["_price_df"]}
+                    st.rerun()
 
-            st.markdown("### 📊 選擇標的查看 K 線圖")
-            stock_options = {r["代號"]: r for r in results}
-            default_idx = 0
-            if st.session_state.selected_stock and st.session_state.selected_stock["sid"] in stock_options:
-                default_idx = list(stock_options.keys()).index(st.session_state.selected_stock["sid"])
+                cols[1].markdown(f"<div style='font-size:11px;color:#aaa;margin-top:-8px;padding-left:4px;'>{industry}</div>", unsafe_allow_html=True)
+                cols[2].markdown(f"<div style='font-size:13px;padding:6px 0;'>{close:.2f}</div>", unsafe_allow_html=True)
+                cols[3].markdown(f"<div style='color:{dc};font-weight:bold;font-size:13px;padding:6px 0;'>{dpct:+.2f}%</div>", unsafe_allow_html=True)
+                cols[4].markdown(f"<div style='font-size:13px;padding:6px 0;'>{int(r['外資連買 (天)'])} 天</div>", unsafe_allow_html=True)
+                cols[5].markdown(f"<div style='color:{fc};font-size:13px;padding:6px 0;'>{int(fnet):,}</div>", unsafe_allow_html=True)
+                cols[6].markdown(f"<div style='color:{wc};font-size:13px;padding:6px 0;'>{int(whale):+,}</div>", unsafe_allow_html=True)
+                cols[7].markdown(f"<div style='color:{rc};font-size:13px;padding:6px 0;'>{int(retail):+,}</div>", unsafe_allow_html=True)
+                cols[8].markdown(f"<div style='color:#666;font-size:13px;padding:6px 0;'>{r['糾結度 (%)']:.2f}%</div>", unsafe_allow_html=True)
+                cols[9].markdown(f"<div style='color:#666;font-size:13px;padding:6px 0;'>{r['乖離 20WMA (%)']:+.2f}%</div>", unsafe_allow_html=True)
+                if use_c6:
+                    kd_k = r.get("KD_K", 0.0); kd_d = r.get("KD_D", 0.0)
+                    kd_c = "#c0392b" if kd_k > kd_d else "#16a085"
+                    cross_ago = r.get("KD交叉天前", -1)
+                    cross_txt = "今日" if cross_ago == 0 else (f"{cross_ago}天前" if cross_ago >= 0 else "-")
+                    cols[10].markdown(f"<div style='color:{kd_c};font-weight:bold;font-size:13px;padding:6px 0;'>{kd_k:.1f}</div>", unsafe_allow_html=True)
+                    cols[11].markdown(f"<div style='color:{kd_c};font-size:13px;padding:6px 0;'>{kd_d:.1f}</div>", unsafe_allow_html=True)
+                    cols[12].markdown(f"<div style='color:#888;font-size:13px;padding:6px 0;'>{cross_txt}</div>", unsafe_allow_html=True)
+                if use_c7:
+                    hist = r.get("MACD_柱狀", 0.0); dif = r.get("MACD_DIF", 0.0)
+                    ci = 10 + (3 if use_c6 else 0)
+                    hist_c = "#c0392b" if hist >= 0 else "#16a085"
+                    dif_c  = "#c0392b" if dif  >= 0 else "#16a085"
+                    cols[ci].markdown(f"<div style='color:{hist_c};font-weight:bold;font-size:13px;padding:6px 0;'>{hist:.3f}</div>", unsafe_allow_html=True)
+                    cols[ci+1].markdown(f"<div style='color:{dif_c};font-size:13px;padding:6px 0;'>{dif:.3f}</div>", unsafe_allow_html=True)
 
-            selected_sid = st.selectbox(
-                "請選擇要查看的股票：",
-                options=list(stock_options.keys()),
-                format_func=lambda x: f"{x} {stock_options[x]['名稱']}  ({stock_options[x].get('產業', '')})",
-                index=default_idx
-            )
-
-            if selected_sid:
-                st.session_state.selected_stock = {
-                    "sid": selected_sid,
-                    "name": stock_options[selected_sid]["名稱"],
-                    "price_df": stock_options[selected_sid]["_price_df"]
-                }
-
-            st.markdown("<hr style='margin:10px 0;'>", unsafe_allow_html=True)
-
-            sel = st.session_state.selected_stock
-            if sel:
-                sid, name, price_df = sel["sid"], sel["name"], sel["price_df"]
-                st.markdown(f"<div style='font-size:18px;font-weight:700;color:#1a1a1a;border-left:4px solid #e74c3c;padding-left:10px;margin:16px 0 8px 0;'>📊 {sid} {name} · K 線圖</div>", unsafe_allow_html=True)
-                if price_df is None or price_df.empty: st.warning("⚠️ 此股票無行情資料。")
-                else:
-                    df_chart = price_df.copy().rename(columns={"max": "high", "min": "low", "Trading_Volume": "volume"})
-                    for col_name in ["open", "high", "low", "close", "volume"]:
-                        if col_name not in df_chart.columns: df_chart[col_name] = 0.0
-                        df_chart[col_name] = pd.to_numeric(df_chart[col_name], errors="coerce").fillna(0.0)
-                    df_chart = df_chart.sort_values("date").reset_index(drop=True)
-                    for w in [5, 20, 60, 100, 120, 240]: df_chart[f"MA{w}"] = df_chart["close"].rolling(w, min_periods=w).mean()
-                    for col_name in ["外資", "投信"]:
-                        if col_name not in df_chart.columns: df_chart[col_name] = 0
-                    try:
-                        fig = plot_combined_chart(df_chart, sid, name, show_ma_dict=show_ma, k_line_type=k_line_type)
-                        st.plotly_chart(fig, use_container_width=True)
-                    except Exception as e: st.error(f"❌ 繪圖失敗：{e}")
+                # ── K 線圖（展開在名稱正下方）─────────────────
+                if is_selected:
+                    price_df = r["_price_df"]
+                    st.markdown(f"<div style='font-size:16px;font-weight:700;color:#1a1a1a;border-left:4px solid #e74c3c;padding-left:10px;margin:12px 0 6px 0;'>📊 {sid} {name} · K 線圖</div>", unsafe_allow_html=True)
+                    if price_df is None or price_df.empty:
+                        st.warning("⚠️ 此股票無行情資料。")
+                    else:
+                        df_chart = price_df.copy().rename(columns={"max": "high", "min": "low", "Trading_Volume": "volume"})
+                        for col_name in ["open", "high", "low", "close", "volume"]:
+                            if col_name not in df_chart.columns: df_chart[col_name] = 0.0
+                            df_chart[col_name] = pd.to_numeric(df_chart[col_name], errors="coerce").fillna(0.0)
+                        df_chart = df_chart.sort_values("date").reset_index(drop=True)
+                        for w in [5, 20, 60, 100, 120, 240]: df_chart[f"MA{w}"] = df_chart["close"].rolling(w, min_periods=w).mean()
+                        for col_name in ["外資", "投信"]:
+                            if col_name not in df_chart.columns: df_chart[col_name] = 0
+                        try:
+                            fig = plot_combined_chart(df_chart, sid, name, show_ma_dict=show_ma, k_line_type=k_line_type)
+                            st.plotly_chart(fig, use_container_width=True)
+                        except Exception as e:
+                            st.error(f"❌ 繪圖失敗：{e}")
     else:
         st.info("👈 請在左側設定條件後，點擊「開始全市場極速掃描」。")
 
