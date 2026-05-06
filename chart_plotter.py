@@ -47,31 +47,70 @@ def _get_yoy_range(df_revenue, pad_abs=8.0, pad_ratio=0.25, pad_cap=20.0, min_sp
     except Exception: return None
 
 
+def _calc_kd(df: pd.DataFrame, rsv_period: int = 9):
+    """計算 KD，支援 max/min 或 high/low 欄位名稱"""
+    high_col = "high" if "high" in df.columns else "max"
+    low_col  = "low"  if "low"  in df.columns else "min"
+    hi = pd.to_numeric(df[high_col], errors="coerce")
+    lo = pd.to_numeric(df[low_col],  errors="coerce")
+    cl = pd.to_numeric(df["close"],  errors="coerce")
+    roll_high = hi.rolling(rsv_period).max()
+    roll_low  = lo.rolling(rsv_period).min()
+    denom = (roll_high - roll_low).replace(0, pd.NA)
+    rsv = ((cl - roll_low) / denom * 100).fillna(50).tolist()
+    k, d = 50.0, 50.0
+    k_vals, d_vals = [], []
+    for r in rsv:
+        k = k * 2/3 + r * 1/3
+        d = d * 2/3 + k * 1/3
+        k_vals.append(k)
+        d_vals.append(d)
+    return pd.Series(k_vals, index=df.index), pd.Series(d_vals, index=df.index)
+
+
+def _calc_macd(df: pd.DataFrame, fast=12, slow=26, signal=9):
+    """計算 MACD DIF / DEA / Histogram（×2）"""
+    cl = pd.to_numeric(df["close"], errors="coerce")
+    ema_fast  = cl.ewm(span=fast,   adjust=False).mean()
+    ema_slow  = cl.ewm(span=slow,   adjust=False).mean()
+    dif       = ema_fast - ema_slow
+    dea       = dif.ewm(span=signal, adjust=False).mean()
+    histogram = dif - dea  # DIF - MACD（DEA），不乘 2，與看盤軟體一致
+    return dif, dea, histogram
+
+
 def plot_combined_chart(df, stock_id, stock_name, show_ma_dict, k_line_type="一般K線"):
     """
-    四子圖完整版：K線、成交量、外資、投信 (徹底清除第五張圖的殘留)
+    六子圖完整版：K線、成交量、外資、投信、KD、MACD
     """
     df = df.copy()
     df = df.sort_values('date').reset_index(drop=True)
     chart_revision = f"{stock_id}"
-    
-    # 嚴格定義只有 4 列，並且標題陣列只有 4 個
+
+    # ── 計算 KD ──────────────────────────────────────────
+    k_series, d_series = _calc_kd(df)
+    df['KD_K'] = k_series.values
+    df['KD_D'] = d_series.values
+
+    # ── 計算 MACD ─────────────────────────────────────────
+    dif, dea, histogram = _calc_macd(df)
+    df['MACD_DIF']  = dif.values
+    df['MACD_DEA']  = dea.values
+    df['MACD_HIST'] = histogram.values
+
     fig = make_subplots(
-        rows=4, cols=1, 
-        shared_xaxes=True, 
-        vertical_spacing=0.08, 
-        row_heights=[0.55, 0.15, 0.15, 0.15],
-        specs=[
-            [{"secondary_y": False}], 
-            [{"secondary_y": False}], 
-            [{"secondary_y": False}], 
-            [{"secondary_y": False}]
-        ],
+        rows=6, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.40, 0.12, 0.12, 0.12, 0.12, 0.12],
+        specs=[[{"secondary_y": False}]] * 6,
         subplot_titles=(
-            f"{stock_id} {stock_name} 股價走勢 ({k_line_type})", 
-            "成交量 (張)", 
-            "外資買賣超 (張)", 
-            "投信買賣超 (張)"
+            f"{stock_id} {stock_name} 股價走勢 ({k_line_type})",
+            "成交量 (張)",
+            "外資買賣超 (張)",
+            "投信買賣超 (張)",
+            "KD",
+            "MACD",
         )
     )
 
@@ -86,50 +125,79 @@ def plot_combined_chart(df, stock_id, stock_name, show_ma_dict, k_line_type="一
         if show and ma_name in df.columns:
             valid_ma = df[df[ma_name] > 0]
             if not valid_ma.empty:
-                fig.add_trace(go.Scatter(x=valid_ma['date'], y=valid_ma[ma_name], name=ma_name, line=dict(color=ma_colors.get(ma_name, 'white'), width=1.5), showlegend=True), row=1, col=1)
+                fig.add_trace(go.Scatter(x=valid_ma['date'], y=valid_ma[ma_name], name=ma_name,
+                    line=dict(color=ma_colors.get(ma_name, 'white'), width=1.5), showlegend=True), row=1, col=1)
 
     # 2. 成交量
     if 'volume' in df.columns:
         vol_colors = ['#ef5350' if c >= o else '#26a69a' for c, o in zip(df['close'], df['open'])]
-        fig.add_trace(go.Bar(x=df['date'], y=df['volume'], name='成交量', marker_color=vol_colors, showlegend=False), row=2, col=1)
+        fig.add_trace(go.Bar(x=df['date'], y=df['volume'], name='成交量',
+            marker_color=vol_colors, showlegend=False), row=2, col=1)
 
     # 3. 外資
     if '外資' in df.columns:
         f_colors = ['#ef5350' if v >= 0 else '#26a69a' for v in df['外資']]
-        fig.add_trace(go.Bar(x=df['date'], y=df['外資'], name='外資', marker_color=f_colors, showlegend=False), row=3, col=1)
+        fig.add_trace(go.Bar(x=df['date'], y=df['外資'], name='外資',
+            marker_color=f_colors, showlegend=False), row=3, col=1)
 
     # 4. 投信
     if '投信' in df.columns:
         t_colors = ['#ef5350' if v >= 0 else '#26a69a' for v in df['投信']]
-        fig.add_trace(go.Bar(x=df['date'], y=df['投信'], name='投信', marker_color=t_colors, showlegend=False), row=4, col=1)
+        fig.add_trace(go.Bar(x=df['date'], y=df['投信'], name='投信',
+            marker_color=t_colors, showlegend=False), row=4, col=1)
 
-    # 日期與版面配置
+    # 5. KD
+    fig.add_trace(go.Scatter(x=df['date'], y=df['KD_K'], name='K',
+        line=dict(color='#FFD700', width=1.5), showlegend=True), row=5, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['KD_D'], name='D',
+        line=dict(color='#FF69B4', width=1.5), showlegend=True), row=5, col=1)
+    # 超買超賣參考線
+    for ref_val, ref_color in [(80, 'rgba(239,83,80,0.3)'), (20, 'rgba(38,166,154,0.3)')]:
+        fig.add_hline(y=ref_val, line_dash="dot", line_color=ref_color, line_width=1, row=5, col=1)
+
+    # 6. MACD
+    hist_colors = ['#ef5350' if v >= 0 else '#26a69a' for v in df['MACD_HIST']]
+    fig.add_trace(go.Bar(x=df['date'], y=df['MACD_HIST'], name='柱狀',
+        marker_color=hist_colors, showlegend=False), row=6, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MACD_DIF'], name='DIF',
+        line=dict(color='#FFD700', width=1.5), showlegend=True), row=6, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MACD_DEA'], name='DEA',
+        line=dict(color='#FF69B4', width=1.5), showlegend=True), row=6, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color='rgba(255,255,255,0.2)', line_width=1, row=6, col=1)
+
+    # ── 版面配置 ──────────────────────────────────────────
     dt_all = pd.to_datetime(df['date']).dt.date
     missing_days = [d for d in pd.date_range(dt_all.min(), dt_all.max()).date if d not in set(dt_all)]
-    
+
     total_days = len(df)
     display_days = min(125, total_days)
     initial_range = [df['date'].iloc[-display_days], df['date'].iloc[-1]]
-    
+
+    rangebreak_cfg = [dict(values=missing_days)]
+    xaxis_common = dict(matches='x', rangebreaks=rangebreak_cfg, fixedrange=False)
+
     fig.update_layout(
-        height=1000, # 高度進一步縮減，讓四張圖更緊湊
-        plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white', size=16),
-        hovermode='x unified', margin=dict(l=10, r=10, t=100, b=20), uirevision=chart_revision,
+        height=1200,
+        plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white', size=14),
+        hovermode='x unified', margin=dict(l=10, r=10, t=80, b=20), uirevision=chart_revision,
         xaxis_rangeslider_visible=False,
-        xaxis=dict(rangebreaks=[dict(values=missing_days)], range=initial_range if not st.session_state.get(f'__init_range__{stock_id}', False) else None, type='date', fixedrange=False),
-        xaxis2=dict(matches='x', rangebreaks=[dict(values=missing_days)], fixedrange=False),
-        xaxis3=dict(matches='x', rangebreaks=[dict(values=missing_days)], fixedrange=False),
-        xaxis4=dict(matches='x', rangebreaks=[dict(values=missing_days)], fixedrange=False),
-        legend=dict(orientation="h", y=1.04, x=0.5, xanchor="center"),
+        xaxis=dict(rangebreaks=rangebreak_cfg,
+                   range=initial_range if not st.session_state.get(f'__init_range__{stock_id}', False) else None,
+                   type='date', fixedrange=False),
+        xaxis2=xaxis_common, xaxis3=xaxis_common, xaxis4=xaxis_common,
+        xaxis5=xaxis_common, xaxis6=xaxis_common,
+        legend=dict(orientation="h", y=1.03, x=0.5, xanchor="center"),
         autosize=True, dragmode='zoom'
     )
 
     st.session_state[f'__init_range__{stock_id}'] = True
-    
+
     fig.update_yaxes(row=1, col=1, gridcolor='#333', fixedrange=False)
-    fig.update_yaxes(title_text="張", row=2, col=1, gridcolor='#333', tickformat=',d', fixedrange=False)
-    fig.update_yaxes(title_text="張", row=3, col=1, gridcolor='#333', tickformat=',d', fixedrange=False)
-    fig.update_yaxes(title_text="張", row=4, col=1, gridcolor='#333', tickformat=',d', fixedrange=False)
+    fig.update_yaxes(title_text="張",  row=2, col=1, gridcolor='#333', tickformat=',d', fixedrange=False)
+    fig.update_yaxes(title_text="張",  row=3, col=1, gridcolor='#333', tickformat=',d', fixedrange=False)
+    fig.update_yaxes(title_text="張",  row=4, col=1, gridcolor='#333', tickformat=',d', fixedrange=False)
+    fig.update_yaxes(title_text="KD",  row=5, col=1, gridcolor='#333', range=[0, 100], fixedrange=False)
+    fig.update_yaxes(title_text="MACD",row=6, col=1, gridcolor='#333', fixedrange=False)
     fig.update_xaxes(showgrid=True, gridcolor='#333')
 
     return fig
